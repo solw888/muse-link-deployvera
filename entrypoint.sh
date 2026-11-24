@@ -39,14 +39,19 @@ log() { printf '[%s] [entrypoint] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { log "ERROR: $*"; exit 1; }
 
 # --- 1. token -------------------------------------------------------------
+# Trim any whitespace the platform may have added when injecting the variable
+# (e.g. a trailing newline). A valid token has no whitespace at all.
+# Log only the length, never the value.
+TOKEN="$(printf '%s' "$TOKEN" | tr -d '[:space:]')"
+log "MUSE_LINK_API_TOKEN length after trim: ${#TOKEN}"
 if [ -z "$TOKEN" ]; then
   die "MUSE_LINK_API_TOKEN is not set. Generate a random token (32-256 printable ASCII chars, no spaces) and set it as an environment variable in the DeployVera panel. Do NOT commit it to the repo."
 fi
 if [ "${#TOKEN}" -lt 32 ] || [ "${#TOKEN}" -gt 256 ]; then
-  die "MUSE_LINK_API_TOKEN must be 32-256 characters."
+  die "MUSE_LINK_API_TOKEN must be 32-256 characters (got ${#TOKEN})."
 fi
 case "$TOKEN" in
-  *[!-~]*|*\ *) die "MUSE_LINK_API_TOKEN must be printable ASCII without spaces." ;;
+  *[!-~]*|*\ *) die "MUSE_LINK_API_TOKEN must be printable ASCII without spaces (length ${#TOKEN})." ;;
 esac
 
 # --- 2. runtime dirs + config ----------------------------------------------
