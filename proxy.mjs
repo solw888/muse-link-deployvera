@@ -18,8 +18,8 @@
 // It is never written to a log or a response.
 
 import http from 'node:http';
-import { createReadStream, readdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { createReadStream, readdirSync, statSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { join, basename, resolve, sep } from 'node:path';
 
 const PORT = Number(process.env.PORT || 3000);
 const BRIDGE_HOST = '127.0.0.1';
@@ -28,6 +28,8 @@ const BRIDGE_HOST = '127.0.0.1';
 const BRIDGE_PORT = Number(process.env.MUSE_LINK_BRIDGE_PORT || 18791);
 const BRIDGE = `http://${BRIDGE_HOST}:${BRIDGE_PORT}`;
 const QR_DIR = process.env.MUSE_LINK_QR_DIR || '/data/qr';
+const MEDIA_ROOT = process.env.MUSE_LINK_MEDIA_ROOT || '/data/workspace';
+const DATA_DIR = process.env.MUSE_LINK_DATA_DIR || '/data';
 const API_TOKEN = process.env.MUSE_LINK_API_TOKEN || '';
 
 const log = (event, fields = {}) =>
@@ -93,7 +95,7 @@ function statusPage({ up, loggedIn }) {
     loggedIn === true ? 'WeChat: logged in' :
     loggedIn === false ? 'WeChat: NOT logged in — open /qr and scan the code' :
     'WeChat: login state unknown (bridge down or token not set)';
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Muse Link bridge</title></head><body style="font-family:system-ui,sans-serif;max-width:640px;margin:2em auto;padding:0 1em;line-height:1.6"><h1>Muse Link bridge (DeployVera test)</h1><p>${bridgeLine}</p><p>${loginLine}</p><ul><li><a href="/qr">WeChat login QR code</a></li><li><a href="/healthz">health check (JSON)</a></li></ul><p style="color:#666">The bridge API is proxied under /v1/* and requires the Bearer api_token. Text replies work; media send-back from another machine is out of scope for this test.</p></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Muse Link bridge</title></head><body style="font-family:system-ui,sans-serif;max-width:640px;margin:2em auto;padding:0 1em;line-height:1.6"><h1>Muse Link bridge (DeployVera test)</h1><p>${bridgeLine}</p><p>${loginLine}</p><ul><li><a href="/qr">WeChat login QR code</a></li><li><a href="/healthz">health check (JSON)</a></li></ul><p style="color:#666">The bridge API is proxied under /v1/* and requires the Bearer api_token. Media: POST /upload (Bearer) to put a file in the bridge's media root, GET /media/&lt;path&gt; (Bearer) to fetch a file the bridge stored.</p></body></html>`;
 }
 
 function qrPage({ loggedIn, hasQr }) {
@@ -104,6 +106,100 @@ function qrPage({ loggedIn, hasQr }) {
     return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>QR — not ready</title></head><body style="font-family:system-ui,sans-serif;max-width:640px;margin:2em auto;padding:0 1em;line-height:1.6"><h1>No QR code yet</h1><p>The bridge is still starting or has not begun login. Refresh this page in a few seconds.</p><p><a href="/">Back to status</a></p></body></html>`;
   }
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WeChat login QR</title></head><body style="font-family:system-ui,sans-serif;max-width:640px;margin:2em auto;padding:0 1em;line-height:1.6"><h1>Scan with WeChat to log in</h1><p><img src="/qr.png" alt="WeChat login QR code" style="width:320px;height:320px;image-rendering:pixelated;border:1px solid #ccc"></p><p>The code refreshes every few minutes. If this one does not scan, refresh the page for a new code.</p><p><a href="/">Back to status</a></p></body></html>`;
+}
+
+// --- media upload / download ---------------------------------------------
+// POST /upload?filename=<name> — save raw file bytes (Content-Type:
+// application/octet-stream) under MEDIA_ROOT/uploads/ and return the
+// absolute container path, which the bridge can then send via its media
+// reply. GET /media/<relpath> — serve a file from under DATA_DIR (used to
+// fetch inbound media the bridge downloaded, e.g. a photo the user sent).
+// Both require the Bearer api_token, the same token the bridge API uses.
+
+function checkAuth(req) {
+  if (!API_TOKEN) return false;
+  const h = req.headers.authorization || '';
+  return h === `Bearer ${API_TOKEN}`;
+}
+
+const MIME_BY_EXT = {
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp',
+  '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
+  '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg',
+  '.pdf': 'application/pdf', '.txt': 'text/plain; charset=utf-8',
+  '.json': 'application/json', '.zip': 'application/zip',
+};
+
+function mimeFor(filePath) {
+  const dot = filePath.lastIndexOf('.');
+  const ext = dot >= 0 ? filePath.slice(dot).toLowerCase() : '';
+  return MIME_BY_EXT[ext] || 'application/octet-stream';
+}
+
+function handleUpload(req, res, url) {
+  if (!checkAuth(req)) { send(res, 401, 'application/json', JSON.stringify({ error: 'unauthorized' })); return; }
+  const rawName = url.searchParams.get('filename') || '';
+  // Sanitize: basename only, no path separators, no leading dot, must have a name.
+  const name = basename(rawName).replace(/[^A-Za-z0-9._-]/g, '_');
+  if (!name || name === '.' || name === '..' || name.startsWith('.')) {
+    send(res, 400, 'application/json', JSON.stringify({ error: 'invalid_filename' }));
+    return;
+  }
+  const chunks = [];
+  let total = 0;
+  const MAX_BYTES = 50 * 1024 * 1024; // 50 MiB, the bridge's file limit
+  req.on('data', (c) => {
+    total += c.length;
+    if (total > MAX_BYTES) { req.destroy(); return; }
+    chunks.push(c);
+  });
+  req.on('end', () => {
+    if (total > MAX_BYTES) {
+      if (!res.headersSent) send(res, 413, 'application/json', JSON.stringify({ error: 'file_too_large', max_bytes: MAX_BYTES }));
+      return;
+    }
+    try {
+      const dir = join(MEDIA_ROOT, 'uploads');
+      mkdirSync(dir, { recursive: true });
+      // Unique name to avoid overwriting an earlier upload.
+      let dest = join(dir, name);
+      if (existsSync(dest)) {
+        const dot = name.lastIndexOf('.');
+        const stem = dot > 0 ? name.slice(0, dot) : name;
+        const ext = dot > 0 ? name.slice(dot) : '';
+        dest = join(dir, `${stem}-${Date.now()}${ext}`);
+      }
+      writeFileSync(dest, Buffer.concat(chunks));
+      log('upload_saved', { path: dest, bytes: total });
+      send(res, 200, 'application/json', JSON.stringify({ ok: true, path: dest, bytes: total }));
+    } catch (err) {
+      log('upload_error', { message: String(err && err.message ? err.message : err) });
+      if (!res.headersSent) send(res, 500, 'application/json', JSON.stringify({ error: 'upload_failed' }));
+    }
+  });
+  req.on('error', () => {
+    if (!res.headersSent) send(res, 500, 'application/json', JSON.stringify({ error: 'upload_failed' }));
+  });
+}
+
+function handleMediaDownload(req, res, url) {
+  if (!checkAuth(req)) { send(res, 401, 'application/json', JSON.stringify({ error: 'unauthorized' })); return; }
+  const rel = decodeURIComponent(url.pathname.slice('/media/'.length));
+  // Resolve under DATA_DIR and reject any escape (no .. traversal).
+  const resolved = resolve(DATA_DIR, rel);
+  if (resolved !== DATA_DIR && !resolved.startsWith(DATA_DIR + sep)) {
+    send(res, 400, 'application/json', JSON.stringify({ error: 'invalid_path' }));
+    return;
+  }
+  let st;
+  try { st = statSync(resolved); } catch { st = null; }
+  if (!st || !st.isFile()) { send(res, 404, 'application/json', JSON.stringify({ error: 'not_found' })); return; }
+  res.writeHead(200, { 'content-type': mimeFor(resolved), 'content-length': st.size, 'cache-control': 'no-store' });
+  createReadStream(resolved).on('error', () => {
+    if (!res.headersSent) send(res, 500, 'text/plain; charset=utf-8', 'Could not read the file.');
+    else res.end();
+  }).pipe(res);
 }
 
 // --- reverse proxy -------------------------------------------------------
@@ -169,6 +265,14 @@ const server = http.createServer(async (req, res) => {
         if (!res.headersSent) send(res, 500, 'text/plain; charset=utf-8', 'Could not read the QR file.');
         else res.end();
       }).pipe(res);
+      return;
+    }
+    if (req.method === 'POST' && path === '/upload') {
+      handleUpload(req, res, url);
+      return;
+    }
+    if (req.method === 'GET' && path.startsWith('/media/')) {
+      handleMediaDownload(req, res, url);
       return;
     }
     // Everything else: the bridge API (auth enforced by the bridge itself).
