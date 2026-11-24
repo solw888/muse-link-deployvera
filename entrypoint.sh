@@ -107,7 +107,20 @@ while ! is_logged_in; do
   log "not logged in to WeChat (attempt $attempt/$max_attempts) — open the app URL + /qr in a browser and scan the code with WeChat"
   # Blocks until scanned, expired, or --timeout (10m). A fresh QR is written
   # every few minutes inside one attempt; the proxy always serves the latest.
-  if $CLI login --config "$CONFIG" --qr-dir "$QR_DIR" --timeout 10m; then
+  # Capture the login output: if it reports logged_in:true, trust it and start
+  # the daemon. Do NOT veto a successful login with a status re-check — the
+  # status command can lag the login's session write and would discard a login
+  # that already succeeded (observed 2026-11-24: login printed logged_in:true
+  # but the re-check still said "not logged in", so the daemon never started
+  # and later scans were rejected with account_changed).
+  login_out="$($CLI login --config "$CONFIG" --qr-dir "$QR_DIR" --timeout 10m 2>&1)"
+  login_code=$?
+  printf '%s\n' "$login_out"
+  if printf '%s' "$login_out" | grep -q '"logged_in": *true'; then
+    log "login command reported logged_in:true; starting bridge daemon"
+    break
+  fi
+  if [ "$login_code" -eq 0 ]; then
     log "login command finished; re-checking login status"
   else
     log "login attempt $attempt ended without a confirmed login (timeout or error); will retry"
