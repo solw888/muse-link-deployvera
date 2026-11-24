@@ -50,9 +50,9 @@ fi
 if [ "${#TOKEN}" -lt 32 ] || [ "${#TOKEN}" -gt 256 ]; then
   die "MUSE_LINK_API_TOKEN must be 32-256 characters (got ${#TOKEN})."
 fi
-case "$TOKEN" in
-  *[!-~]*|*\ *) die "MUSE_LINK_API_TOKEN must be printable ASCII without spaces (length ${#TOKEN})." ;;
-esac
+if ! [[ "$TOKEN" =~ ^[!-~]+$ ]]; then
+  die "MUSE_LINK_API_TOKEN must be printable ASCII without spaces (length ${#TOKEN})."
+fi
 
 # --- 2. runtime dirs + config ----------------------------------------------
 mkdir -p "$STATE_DIR" "$QR_DIR" "$MEDIA_ROOT" "$(dirname "$CONFIG")"
