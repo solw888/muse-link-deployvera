@@ -12,12 +12,15 @@
 #   WeChat login QR image, and answers health checks.
 #
 # Source:
-#   The bridge source is cloned from the official repo at the exact commit the
-#   v0.4.0-rc.5 release was built from (source-commit.txt in the local install):
-#   commit 2d026ef89745c5820ad5b50406653bdb8a781df4, release
-#   "three-versions-20261029". The local file-support patch was applied AFTER
-#   install as file modifications, so this commit is the CLEAN official rc.5
-#   (inbound media yes, inbound files no). No local patched files are used.
+#   The bridge source is the official v0.4.0-rc.5 clean-install zip from the
+#   upstream repo (release "three-versions-20261029"):
+#   packages/muse-link-v0.4.0-rc.5-clean-install.zip. The upstream repo ships
+#   the bridge as a zip, not as source in git (the old commit
+#   2d026ef89745c5820ad5b50406653bdb8a781df4 no longer exists upstream — the
+#   repo now has a single commit ab04fe39). This is the CLEAN official rc.5
+#   (inbound media yes, inbound files no). The local file-support patch was
+#   applied AFTER install as file modifications, so no local patched files
+#   are used.
 #
 # Persistence caveat (read README.md):
 #   DeployVera documents NO persistent volume for a Dockerfile app on the free
@@ -28,24 +31,25 @@
 
 FROM node:24-slim
 
-# git (clone the bridge source) + ca-certificates (TLS) + curl (health checks).
+# unzip (extract the bridge zip) + ca-certificates (TLS) + curl (health checks + download).
 # No native build tools needed: the bridge deps (qrcode, silk-wasm, undici)
 # are pure JS / WASM, no compiled addons.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates curl \
+    && apt-get install -y --no-install-recommends unzip ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Clone the official repo and check out the exact rc.5 commit, then install
-# production dependencies. Verify the version so a wrong checkout fails loudly.
-RUN git clone https://github.com/xianjia95-oss/muse-wechat-clawbot.git /app/muse-link \
-    && git -C /app/muse-link checkout 2d026ef89745c5820ad5b50406653bdb8a781df4 \
-    && git -C /app/muse-link rev-parse HEAD \
+# Download the official rc.5 clean-install zip and extract it, then install
+# production dependencies. Verify the version so a wrong file fails loudly.
+# The zip contains package-lock.json, so "npm ci" works.
+RUN curl -fsSL -o /tmp/muse-link.zip https://raw.githubusercontent.com/xianjia95-oss/muse-wechat-clawbot/three-versions-20261029/packages/muse-link-v0.4.0-rc.5-clean-install.zip \
+    && mkdir -p /app/muse-link \
+    && unzip -q /tmp/muse-link.zip -d /app/muse-link \
+    && rm -f /tmp/muse-link.zip \
     && grep -q '"version": "0.4.0-rc.5"' /app/muse-link/package.json \
     && cd /app/muse-link && npm ci --omit=dev --no-fund --no-audit \
-    && npm cache clean --force \
-    && rm -rf /app/muse-link/.git
+    && npm cache clean --force
 
 # Runtime data lives under /data (writable container layer; see persistence note).
 # /data itself is world-writable so the container works whether it runs as root
